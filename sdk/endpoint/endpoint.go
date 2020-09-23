@@ -44,13 +44,25 @@ type NsmEndpoint interface {
 	Delete() error
 }
 
+// Registration stores parameters that NsmEndpoint passes to the RegisterNSE
+// gRPC call.
+type Registration struct {
+	Name   string
+	Labels map[string]string
+}
+
 type nsmEndpoint struct {
 	*common.NsmConnection
 	service        networkservice.NetworkServiceServer
 	grpcServer     *grpc.Server
 	registryClient registry.NetworkServiceRegistryClient
-	endpointName   string
+	registrations  []endpointRegistration
 	tracerCloser   io.Closer
+}
+
+type endpointRegistration struct {
+	Registration
+	registeredName string
 }
 
 func (nsme *nsmEndpoint) setupNSEServerConnection() (net.Listener, error) {
@@ -84,7 +96,6 @@ func (nsme *nsmEndpoint) Start() error {
 	unified.RegisterNetworkServiceServer(nsme.grpcServer, nsme)
 
 	listener, err := nsme.setupNSEServerConnection()
-
 	if err != nil {
 		logrus.Errorf("Unable to setup NSE")
 		return err
@@ -97,53 +108,70 @@ func (nsme *nsmEndpoint) Start() error {
 		return err
 	}
 
-	// spawn the listnening thread
+	// spawn the listening thread
 	nsme.serve(listener)
 
-	span := spanhelper.FromContext(nsme.Context, fmt.Sprintf("Endpoint-%v-Start", nsme.Configuration.EndpointNetworkService))
-	span.LogObject("labels", nsme.Configuration.EndpointLabels)
+	nsme.registryClient = registry.NewNetworkServiceRegistryClient(nsme.GrpcClient)
+	for i := range nsme.registrations {
+		nsme.register(&nsme.registrations[i])
+	}
+
+	return nil
+}
+
+func (nsme *nsmEndpoint) register(r *endpointRegistration) {
+	span := spanhelper.FromContext(nsme.Context, fmt.Sprintf("Endpoint-%v-Start", r.Name))
+	span.LogObject("labels", r.Labels)
 	defer span.Finish()
 
 	// Registering NSE API, it will listen for Connection requests from NSM and return information
 	// needed for NSE's forwarder programming.
 	nse := &registry.NetworkServiceEndpoint{
-		NetworkServiceName: nsme.Configuration.EndpointNetworkService,
+		NetworkServiceName: r.Name,
 		Payload:            "IP",
-		Labels:             tools.ParseKVStringToMap(nsme.Configuration.EndpointLabels, ",", "="),
+		Labels:             r.Labels,
 	}
 	registration := &registry.NSERegistration{
 		NetworkService: &registry.NetworkService{
-			Name:    nsme.Configuration.EndpointNetworkService,
+			Name:    r.Name,
 			Payload: "IP",
 		},
 		NetworkServiceEndpoint: nse,
 	}
 	span.LogObject("nse-request", registration)
 
-	nsme.registryClient = registry.NewNetworkServiceRegistryClient(nsme.GrpcClient)
 	registeredNSE, err := nsme.registryClient.RegisterNSE(span.Context(), registration)
 	if err != nil {
 		span.Logger().Fatalln("unable to register endpoint", err)
 	}
-	nsme.endpointName = registeredNSE.GetNetworkServiceEndpoint().GetName()
-	span.LogObject("endpoint-name", nsme.endpointName)
+	r.registeredName = registeredNSE.GetNetworkServiceEndpoint().GetName()
+	span.LogObject("endpoint-name", r.registeredName)
 	span.Logger().Infof("NSE registered: %v", registeredNSE)
 	span.Logger().Infof("NSE: channel has been successfully advertised, waiting for connection from NSM...")
-
-	return nil
 }
 
-func (nsme *nsmEndpoint) Delete() error {
-	span := spanhelper.FromContext(context.Background(), fmt.Sprintf("Endpoint-%v-Delete", nsme.Configuration.EndpointNetworkService))
+func (nsme *nsmEndpoint) deregister(r *endpointRegistration) error {
+	span := spanhelper.FromContext(context.Background(), fmt.Sprintf("Endpoint-%v-Delete", r.Name))
 	defer span.Finish()
 	// prepare and defer removing of the advertised endpoint
 	removeNSE := &registry.RemoveNSERequest{
-		NetworkServiceEndpointName: nsme.endpointName,
+		NetworkServiceEndpointName: r.registeredName,
 	}
 	span.LogObject("delete-request", removeNSE)
 	_, err := nsme.registryClient.RemoveNSE(span.Context(), removeNSE)
 	if err != nil {
 		span.Logger().Errorf("Failed removing NSE: %v, with %v", removeNSE, err)
+	}
+	return err
+}
+
+func (nsme *nsmEndpoint) Delete() error {
+	var err error
+	for i := range nsme.registrations {
+		err1 := nsme.deregister(&nsme.registrations[i])
+		if err == nil && err1 != nil {
+			err = err1
+		}
 	}
 	nsme.grpcServer.Stop()
 	_ = nsme.tracerCloser.Close()
@@ -180,8 +208,26 @@ func (nsme *nsmEndpoint) Close(ctx context.Context, incomingConnection *connecti
 	return &empty.Empty{}, nil
 }
 
-// NewNSMEndpoint creates a new NSM endpoint
+// NewNSMEndpoint creates a new NSM endpoint with a single registration.
 func NewNSMEndpoint(ctx context.Context, configuration *common.NSConfiguration, service networkservice.NetworkServiceServer) (NsmEndpoint, error) {
+	registration := []Registration{MakeNsmEndpointRegistration(configuration)}
+	return NewNSMEndpointWithRegistrations(ctx, configuration, service, registration)
+}
+
+// MakeNsmEndpointRegistration extracts Registration from the
+// configuration.
+func MakeNsmEndpointRegistration(configuration *common.NSConfiguration) Registration {
+	return Registration{
+		Name:   configuration.EndpointNetworkService,
+		Labels: tools.ParseKVStringToMap(configuration.EndpointLabels, ",", "="),
+	}
+}
+
+// NewNSMEndpointWithRegistrations creates a new NSM endpoint. It's an extended
+// version of NewNSMEndpoint that provides a way to specify multiple
+// registrations.
+func NewNSMEndpointWithRegistrations(ctx context.Context, configuration *common.NSConfiguration,
+	service networkservice.NetworkServiceServer, registrations []Registration) (NsmEndpoint, error) {
 	if configuration == nil {
 		configuration = &common.NSConfiguration{}
 	}
@@ -196,9 +242,17 @@ func NewNSMEndpoint(ctx context.Context, configuration *common.NSConfiguration, 
 		return nil, err
 	}
 
+	internalRegistrations := make([]endpointRegistration, len(registrations))
+	for i := range registrations {
+		internalRegistrations[i] = endpointRegistration{
+			Registration: registrations[i],
+		}
+	}
+
 	endpoint := &nsmEndpoint{
 		NsmConnection: nsmConnection,
 		service:       service,
+		registrations: internalRegistrations,
 	}
 
 	return endpoint, nil
